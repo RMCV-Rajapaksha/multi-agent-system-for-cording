@@ -112,11 +112,14 @@ def _extract_folder_structure(guide: str) -> str:
 
 
 def _extract_libraries(guide: str) -> list[str]:
-    """Extract package specs from the Recommended Libraries section.
+    """Extract Python package specs from the Recommended Libraries section.
 
-    Handles two common LLM output formats:
-      1. ``pip install fastapi>=0.110`` lines
-      2. Backtick-wrapped specs in bullets: ``- `fastapi>=0.110` — reason``
+    Strategy: a bullet line whose *first* backtick token is a valid package
+    name is a library entry. We take only that first token.
+    Also captures bare ``pip install <pkg>`` lines.
+
+    Valid package name: 2+ chars, alphanumeric + hyphens/underscores,
+    optionally followed by extras [extra] or version specifier >=x.y.
     """
     match = re.search(
         r"## Recommended Libraries\s*\n(.*?)(?=\n##|\Z)",
@@ -126,36 +129,58 @@ def _extract_libraries(guide: str) -> list[str]:
     if not match:
         return []
     block = match.group(1)
+
+    # Prose words that look like package names but aren't
+    _PROSE = {
+        "modern", "fast", "simple", "secure", "async", "sync",
+        "standard", "library", "python", "support", "using",
+        "this", "that", "with", "for", "and", "the",
+    }
+    # pattern: valid package spec token
+    _PKG_RE = re.compile(
+        r"^[a-zA-Z][a-zA-Z0-9_\-]+(\[\w+\])?([><=!~]{1,2}[\w\.\*]+)?$"
+    )
+
     libs: list[str] = []
     for line in block.splitlines():
         stripped = line.strip()
-        # Format 1: pip install <pkg>
+        if not stripped:
+            continue
+
+        # ── Format 1: pip install <pkg> [pkg2 ...] ────────────────────────
         if "pip install" in stripped:
-            after = stripped[stripped.index("pip install") + len("pip install"):].strip()
-            # strip inline flags like -r, --upgrade
-            pkgs = [p for p in after.split() if not p.startswith("-")]
-            libs.extend(pkgs)
-        else:
-            # Format 2: pull out `backtick-wrapped` tokens that look like package specs.
-            # A valid package spec: starts with a letter, contains only pkg-safe chars,
-            # optionally followed by a version specifier (>=, <=, ==, !=, ~=, >).
-            # We explicitly reject tokens containing spaces or looking like prose.
-            for token in re.findall(r"`([^`]+)`", stripped):
-                token = token.strip()
-                # must look like: pkgname, pkg-name, pkg_name, pkg>=1.0, pkg[extra]
-                if re.fullmatch(
-                    r"[a-zA-Z][a-zA-Z0-9_\-]+(\[\w+\])?([><=!~]{1,2}[\w\.\*]+)?",
-                    token,
-                ):
-                    libs.append(token)
-    # de-duplicate while preserving order, drop stray flags
+            after = stripped[stripped.index("pip install") + 11:].strip()
+            # Strip trailing description (after '—', ' - ', or '#')
+            for sep in (" — ", " -- ", " - ", " # "):
+                if sep in after:
+                    after = after[:after.index(sep)]
+            for p in after.split():
+                p = p.strip("',\"`")
+                if p and not p.startswith("-") and _PKG_RE.match(p):
+                    libs.append(p)
+            continue
+
+        # ── Format 2: bullet whose first `backtick` token is the package ──
+        # Strip leading bullet markers
+        core = re.sub(r"^[\-\*\+]\s*", "", stripped)
+        # The FIRST backtick-wrapped token must be at position 0 of core
+        first_bt = re.match(r"`([^`]+)`", core)
+        if first_bt:
+            token = first_bt.group(1).strip()
+            if (
+                _PKG_RE.fullmatch(token)
+                and token.lower() not in _PROSE
+                and len(token) >= 4
+            ):
+                libs.append(token)
+
+    # De-duplicate while preserving order
     seen: set[str] = set()
     result: list[str] = []
     for p in libs:
-        clean = p.strip("\"',")
-        if clean and clean not in seen and not clean.startswith("-"):
-            seen.add(clean)
-            result.append(clean)
+        if p not in seen:
+            seen.add(p)
+            result.append(p)
     return result
 
 
