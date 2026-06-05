@@ -398,54 +398,9 @@ async def _hitl_loop(
     comments: list[str] = list(initial_comments)
     iteration = 0
 
-    while True:
-        iteration += 1
-        ui.show_step(
-            "RESEARCH",
-            f"Generating Implementation Guide (attempt {iteration})…",
-        )
-
-        guide = await _generate_guide(task, research, comments)
-
-        ui.console.print()
-        _print_guide(guide)
-        ui.console.print()
-
-        # ── HITL gate ──────────────────────────────────────────────────────
-        decision, edited_value = ui.request_approval(
-            "RESEARCH GUIDE",
-            "Approve this implementation guide?\n"
-            "  APPROVE = accept and hand off to Coding Agent\n"
-            "  REJECT  = tell us what to change (guide will be regenerated)\n"
-            "  EDIT    = paste your own edited guide directly",
-            allow_edit=True,
-        )
-
-        if decision == "APPROVE":
-            ui.show_success("Implementation Guide approved — moving to Coding Agent.")
-            return guide, comments
-
-        elif decision == "EDIT":
-            if edited_value and edited_value.strip():
-                ui.show_success("Using human-edited guide — skipping regeneration.")
-                return edited_value.strip(), comments
-            else:
-                ui.show_error("Empty edit — falling back to current guide.")
-                return guide, comments
-
-        else:  # REJECT
-            ui.console.print(
-                f"  [{YELLOW}]What should be changed? "
-                "(Press Enter when done):[/]"
-            )
-            feedback = ui.console.input(
-                f"  [bold {AQUA}]Feedback > [/]"
-            ).strip()
-            if feedback:
-                comments.append(feedback)
-                ui.show_reasoning(f"Feedback noted: {feedback!r} — regenerating…")
-            else:
-                ui.show_reasoning("No feedback provided — regenerating with same params.")
+    # The graph orchestrator now handles the loop via `await_guide` node.
+    guide = await _generate_guide(task, research, comments)
+    return guide, comments
 
 
 # ══════════════════════════════════════════════════════════════════════════════
