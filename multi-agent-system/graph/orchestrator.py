@@ -1,8 +1,16 @@
+"""
+graph/orchestrator.py
+---------------------
+LangGraph StateGraph that wires the 3 agents together using proper
+interrupt() / Command(resume=...) mechanics with MemorySaver checkpointing.
+"""
+
+from __future__ import annotations
+
 import asyncio
-from typing import Annotated, Literal
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import interrupt
+from langgraph.types import interrupt, Command
 
 from graph.state import AgentState
 from agents.research_agent import research_agent
@@ -13,152 +21,158 @@ from ui.terminal_ui import AgentUI, AQUA, YELLOW, GREEN, RED
 ui = AgentUI()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Interrupt Nodes
+# Interrupt Nodes — these PAUSE the graph and hand control back to the runner
 # ══════════════════════════════════════════════════════════════════════════════
 
-def await_guide(state: AgentState):
+def await_guide(state: AgentState) -> dict:
     """Pause graph for human review of the Research Guide."""
     ui.show_step("SYSTEM", "Graph paused: Awaiting review of Research Guide")
-    details = state.get("research_guide", "No guide generated.")
-    
-    # We yield an interrupt with the payload for the main loop to display
-    decision_payload = interrupt({
+    guide = state.get("research_guide", "No guide generated.")
+    interrupt({
         "gate": "RESEARCH GUIDE",
-        "details": details,
+        "details": guide,
         "allow_edit": True,
-        "action_desc": "Approve to start coding, Reject to regenerate, Edit to manually adjust."
+        "action_desc": (
+            "APPROVE → hand off to Coding Agent\n"
+            "REJECT  → provide feedback and regenerate\n"
+            "EDIT    → paste your own guide directly"
+        ),
     })
-    
-    # When resumed, the main loop has already updated the state, so we just return
     return {}
 
 
-def await_run(state: AgentState):
-    """Pause graph before the first run/tests."""
-    ui.show_step("SYSTEM", "Graph paused: Awaiting approval to execute project")
-    
-    # If the user rejects, we can handle it via the error_handler
-    decision_payload = interrupt({
+def await_run(state: AgentState) -> dict:
+    """Pause graph before running tests."""
+    ui.show_step("SYSTEM", "Graph paused: Awaiting approval to run the project")
+    interrupt({
         "gate": "RUN PROJECT",
-        "details": "Ready to execute the generated code and run tests.",
+        "details": (
+            "The Coding Agent has finished generating all files.\n"
+            "Approve to hand off to the Testing Agent."
+        ),
         "allow_edit": False,
-        "action_desc": "Approve to execute the generated system, Reject to abort."
+        "action_desc": (
+            "APPROVE → pass to Testing Agent\n"
+            "REJECT  → abort the pipeline"
+        ),
     })
-    
     return {}
 
 
-def await_report(state: AgentState):
+def await_report(state: AgentState) -> dict:
     """Pause graph for human review of the Final QA Report."""
     ui.show_step("SYSTEM", "Graph paused: Awaiting review of Final QA Report")
-    
-    decision_payload = interrupt({
-        "gate": "WRITE FINAL REPORT",
-        "details": state.get("final_report", "No report generated."),
+    report = state.get("final_report", "No report generated yet.")
+    interrupt({
+        "gate": "FINAL REPORT REVIEW",
+        "details": report[:800],
         "allow_edit": True,
-        "action_desc": "Approve to finish, Edit to tweak report, Reject to run more tests."
+        "action_desc": (
+            "APPROVE → mark pipeline as complete\n"
+            "EDIT    → adjust the report manually\n"
+            "REJECT  → run the Testing Agent again"
+        ),
     })
-    
     return {}
 
 
-def error_handler(state: AgentState):
-    """Handle fatal errors or rejections."""
+def error_handler(state: AgentState) -> dict:
+    """Handle fatal errors or user rejections."""
     err = state.get("error") or "Operation aborted by user."
-    ui.show_error(f"Graph aborted: {err}")
+    ui.show_error(f"Pipeline aborted: {err}")
     return {"current_agent": "ERROR"}
 
 
-def complete(state: AgentState):
-    """Print final success summary."""
-    ui.show_success("Pipeline execution complete! All agents finished successfully.")
+def complete(state: AgentState) -> dict:
+    """Print the final success summary."""
+    ui.show_success(
+        "Pipeline complete! All agents finished successfully."
+    )
     return {"current_agent": "COMPLETE"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Edge Routers
+# Conditional edge routers — read hitl_decision set by the runner
 # ══════════════════════════════════════════════════════════════════════════════
 
 def route_after_guide(state: AgentState) -> str:
-    decision = state.get("hitl_decision")
-    if decision == "APPROVE" or decision == "EDIT":
+    decision = (state.get("hitl_decision") or "").upper()
+    if decision in ("APPROVE", "EDIT"):
         return "coding"
-    # If REJECT, go back to research
-    return "research"
+    return "research"          # REJECT → regenerate
+
 
 def route_after_run(state: AgentState) -> str:
-    decision = state.get("hitl_decision")
+    decision = (state.get("hitl_decision") or "").upper()
     if decision == "APPROVE":
         return "testing"
     return "error_handler"
 
+
 def route_after_report(state: AgentState) -> str:
-    decision = state.get("hitl_decision")
-    if decision == "APPROVE" or decision == "EDIT":
+    decision = (state.get("hitl_decision") or "").upper()
+    if decision in ("APPROVE", "EDIT"):
         return "complete"
-    return "testing"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Graph Construction
-# ══════════════════════════════════════════════════════════════════════════════
-
-workflow = StateGraph(AgentState)
-
-# Nodes
-workflow.add_node("research", research_agent)
-workflow.add_node("await_guide", await_guide)
-workflow.add_node("coding", coding_agent)
-workflow.add_node("await_run", await_run)
-workflow.add_node("testing", testing_agent)
-workflow.add_node("await_report", await_report)
-workflow.add_node("error_handler", error_handler)
-workflow.add_node("complete", complete)
-
-# Edges
-workflow.add_edge(START, "research")
-workflow.add_edge("research", "await_guide")
-
-workflow.add_conditional_edges(
-    "await_guide",
-    route_after_guide,
-    {"coding": "coding", "research": "research"}
-)
-
-workflow.add_edge("coding", "await_run")
-
-workflow.add_conditional_edges(
-    "await_run",
-    route_after_run,
-    {"testing": "testing", "error_handler": "error_handler"}
-)
-
-workflow.add_edge("testing", "await_report")
-
-workflow.add_conditional_edges(
-    "await_report",
-    route_after_report,
-    {"complete": "complete", "testing": "testing"}
-)
-
-workflow.add_edge("error_handler", END)
-workflow.add_edge("complete", END)
-
-# Compile with memory saver
-memory = MemorySaver()
-app = workflow.compile(checkpointer=memory)
+    return "testing"           # REJECT → run tests again
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Runner
+# Graph construction
+# ══════════════════════════════════════════════════════════════════════════════
+
+_workflow = StateGraph(AgentState)
+
+_workflow.add_node("research",      research_agent)
+_workflow.add_node("await_guide",   await_guide)
+_workflow.add_node("coding",        coding_agent)
+_workflow.add_node("await_run",     await_run)
+_workflow.add_node("testing",       testing_agent)
+_workflow.add_node("await_report",  await_report)
+_workflow.add_node("error_handler", error_handler)
+_workflow.add_node("complete",      complete)
+
+_workflow.add_edge(START, "research")
+_workflow.add_edge("research", "await_guide")
+
+_workflow.add_conditional_edges(
+    "await_guide", route_after_guide,
+    {"coding": "coding", "research": "research"},
+)
+
+_workflow.add_edge("coding", "await_run")
+
+_workflow.add_conditional_edges(
+    "await_run", route_after_run,
+    {"testing": "testing", "error_handler": "error_handler"},
+)
+
+_workflow.add_edge("testing", "await_report")
+
+_workflow.add_conditional_edges(
+    "await_report", route_after_report,
+    {"complete": "complete", "testing": "testing"},
+)
+
+_workflow.add_edge("error_handler", END)
+_workflow.add_edge("complete", END)
+
+_memory = MemorySaver()
+graph = _workflow.compile(checkpointer=_memory)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Public runner
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def run_pipeline(task: str) -> AgentState:
-    """Creates the state, streams events, and handles interrupts."""
-    
-    thread_id = "run-1"
+    """
+    Stream the graph from start to finish, pausing at every interrupt()
+    node to collect human decisions via AgentUI.request_approval().
+    """
+    thread_id = "pipeline-run"
     config = {"configurable": {"thread_id": thread_id}}
-    
-    initial_state = {
+
+    initial_input: AgentState | None = {
         "messages": [],
         "task": task,
         "research_guide": "",
@@ -176,62 +190,70 @@ async def run_pipeline(task: str) -> AgentState:
         "hitl_edit_value": None,
         "pending_approval": None,
     }
-    
-    # Helper to stream the graph
-    async def process_stream():
-        async for event in app.astream(initial_state, config, stream_mode="updates"):
-            # We don't necessarily need to print everything here since agents print their own UI.
-            # We could look for agent transitions:
-            pass
 
-    # The main execution loop
     while True:
-        await process_stream()
-        
-        state_snapshot = app.get_state(config)
-        
-        # If there are no next nodes, the graph has finished!
-        if not state_snapshot.next:
-            return state_snapshot.values
-            
-        # If the graph is paused at an interrupt
-        if state_snapshot.tasks:
-            for t in state_snapshot.tasks:
-                if t.interrupts:
-                    payload = t.interrupts[0].value
-                    
-                    gate = payload.get("gate", "APPROVAL REQUIRED")
-                    details = payload.get("details", "")
-                    allow_edit = payload.get("allow_edit", False)
-                    desc = payload.get("action_desc", "")
-                    
-                    if desc:
-                        details = f"{desc}\n\n{details}"
-                        
-                    # 1. Call AgentUI.request_approval
-                    decision, edited = ui.request_approval(gate, details, allow_edit=allow_edit)
-                    
-                    # If edited, we might want to apply the edit directly to the state depending on the gate
-                    updates = {"hitl_decision": decision, "hitl_edit_value": edited}
-                    
-                    # Apply specific state modifications based on gate before resuming
-                    if gate == "RESEARCH GUIDE" and decision == "EDIT" and edited:
-                        updates["research_guide"] = edited
-                    elif gate == "RESEARCH GUIDE" and decision == "REJECT":
-                        feedback = ui.console.input(f"  [bold {AQUA}]Feedback > [/]")
-                        current_comments = state_snapshot.values.get("research_comments", [])
-                        current_comments.append(feedback)
-                        updates["research_comments"] = current_comments
-                    elif gate == "WRITE FINAL REPORT" and decision == "EDIT" and edited:
-                        updates["final_report"] = edited
-                        
-                    # 2. Call graph.update_state
-                    app.update_state(config, updates)
-                    
-                    # 3. Resume the graph by passing the value to the interrupt
-                    initial_state = None # To prevent re-initialising the state in the next loop
-                    
-                    from langgraph.types import Command
-                    await app.ainvoke(Command(resume=True), config)
-                    
-                    break # Break out of task loop, continue the while loop
+        # ── stream until the graph pauses or finishes ──────────────────────
+        input_to_send = initial_input  # None after the first pass
+        async for _event in graph.astream(input_to_send, config, stream_mode="updates"):
+            pass                       # agents print their own rich UI
+
+        # After the stream drains, check the graph's checkpoint state
+        snapshot = graph.get_state(config)
+
+        # ── finished? ──────────────────────────────────────────────────────
+        if not snapshot.next:
+            return snapshot.values
+
+        # ── interrupted? ───────────────────────────────────────────────────
+        interrupts_found = False
+        for task_obj in snapshot.tasks:
+            if not task_obj.interrupts:
+                continue
+            interrupts_found = True
+
+            payload  = task_obj.interrupts[0].value
+            gate     = payload.get("gate", "APPROVAL REQUIRED")
+            details  = payload.get("details", "")
+            allow_ed = payload.get("allow_edit", False)
+            desc     = payload.get("action_desc", "")
+
+            # Build the detail string shown in the Rich panel
+            display_details = f"{desc}\n\n{details}" if desc else details
+
+            # Show the panel and collect the decision
+            decision, edited = ui.request_approval(gate, display_details, allow_edit=allow_ed)
+
+            # Build the state patch
+            updates: dict = {
+                "hitl_decision":   decision,
+                "hitl_edit_value": edited,
+            }
+
+            if gate == "RESEARCH GUIDE":
+                if decision == "EDIT" and edited:
+                    updates["research_guide"] = edited
+                elif decision == "REJECT":
+                    feedback = ui.console.input(
+                        f"  [bold {AQUA}]What should be changed? > [/]"
+                    ).strip()
+                    existing = list(snapshot.values.get("research_comments") or [])
+                    existing.append(feedback)
+                    updates["research_comments"] = existing
+                    updates["hitl_decision"] = "REJECT"
+
+            elif gate == "FINAL REPORT REVIEW":
+                if decision == "EDIT" and edited:
+                    updates["final_report"] = edited
+
+            # Patch the checkpoint state
+            graph.update_state(config, updates, as_node=task_obj.name)
+
+            # Resume from the interrupt — passes `True` as the interrupt's
+            # return value and re-enters the graph at the paused node
+            initial_input = Command(resume=True)
+            break   # handle one interrupt per loop iteration
+
+        if not interrupts_found:
+            # No interrupt found but graph still has next nodes — safety exit
+            ui.show_error("Graph stalled — no interrupt found but not finished.")
+            return graph.get_state(config).values

@@ -242,14 +242,19 @@ class AgentUI:
                 f"[{YELLOW}]Please type one of: {options}[/]"
             )
 
-        # ── If EDIT: capture the replacement value ─────────────────────────
+        # ── If EDIT: capture the replacement value (supports multi-line) ──────
         if decision == "EDIT" and allow_edit:
             self.console.print(
-                f"  [{AQUA}]Enter the replacement value (press Enter when done):[/]"
+                f"  [{AQUA}]Enter replacement value.[/] "
+                f"[{YELLOW}]Type [bold]---END---[/bold] on its own line when finished:[/]"
             )
-            edited_value = self.console.input(
-                f"  [bold {BRIGHT_CYAN}]New value > [/]"
-            ).strip()
+            lines: list[str] = []
+            while True:
+                line = self.console.input(f"  [{BRIGHT_CYAN}]> [/]")
+                if line.strip() == "---END---":
+                    break
+                lines.append(line)
+            edited_value = "\n".join(lines).strip()
 
         # ── Visual feedback ────────────────────────────────────────────────
         if decision == "APPROVE":
